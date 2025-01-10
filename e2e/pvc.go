@@ -75,6 +75,19 @@ func createPVCAndvalidatePV(c kubernetes.Interface, pvc *v1.PersistentVolumeClai
 		}
 
 		if pvc.Spec.VolumeName == "" {
+			var events *v1.EventList
+			// Log the events for the PVC if its not bound yet
+			events, err = c.CoreV1().Events(namespace).List(ctx, metav1.ListOptions{
+				FieldSelector: "involvedObject.kind=PersistentVolumeClaim,involvedObject.name=" + name,
+			})
+			if err == nil {
+				for i := range events.Items {
+					framework.Logf("PVC %s Event: %s - %s", name, events.Items[i].Reason, events.Items[i].Message)
+				}
+			} else {
+				framework.Logf("error getting events for PVC %s: %v", name, err)
+			}
+
 			return false, nil
 		}
 
@@ -297,12 +310,12 @@ func deletePVCAndValidatePV(c kubernetes.Interface, pvc *v1.PersistentVolumeClai
 			int(time.Since(start).Seconds()))
 		pvc, err = c.CoreV1().PersistentVolumeClaims(nameSpace).Get(ctx, name, metav1.GetOptions{})
 		if err == nil {
-			framework.Logf("PVC %s (status: %s) has not been deleted yet, rechecking...", name, pvc.Status)
+			framework.Logf("PVC %s (status: %v) has not been deleted yet, rechecking...", name, pvc.Status)
 
 			return false, nil
 		}
 		if isRetryableAPIError(err) {
-			framework.Logf("failed to verify deletion of PVC %s (status: %s): %v", name, pvc.Status, err)
+			framework.Logf("failed to verify deletion of PVC %s (status: %v): %v", name, pvc.Status, err)
 
 			return false, nil
 		}
@@ -428,5 +441,37 @@ func getMetricsForPVC(f *framework.Framework, pvc *v1.PersistentVolumeClaim, t i
 		framework.Logf("no metrics found for pvc %s/%s", pvc.Namespace, pvc.Name)
 
 		return false, nil
+	})
+}
+
+func waitForPVCToBeDeleted(c kubernetes.Interface, namespace, pvcName string, t int) error {
+	timeout := time.Duration(t) * time.Minute
+	ctx := context.TODO()
+	start := time.Now()
+
+	return wait.PollUntilContextTimeout(ctx, poll, timeout, true, func(ctx context.Context) (bool, error) {
+		pvc, err := c.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, pvcName, metav1.GetOptions{})
+		// Check that the PVC is really deleted.
+		framework.Logf(
+			"waiting for PVC %s in state %s to be deleted (%d seconds elapsed)",
+			pvcName,
+			pvc.Status.String(),
+			int(time.Since(start).Seconds()))
+		if err == nil {
+			framework.Logf("PVC %s (status: %v) has not been deleted yet, rechecking...", pvcName, pvc.Status)
+
+			return false, nil
+		}
+		if isRetryableAPIError(err) {
+			framework.Logf("failed to verify deletion of PVC %s (status: %v): %v", pvcName, pvc.Status, err)
+
+			return false, nil
+		}
+		if !apierrs.IsNotFound(err) {
+			return false, fmt.Errorf("get on deleted PVC %v failed with error other than \"not found\": %w", pvcName, err)
+		}
+
+		// PVC has been successfully deleted
+		return true, nil
 	})
 }

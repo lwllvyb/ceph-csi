@@ -19,32 +19,11 @@ package rbd
 import (
 	"context"
 	"fmt"
-	"strings"
+
+	"github.com/ceph/ceph-csi/internal/rbd/types"
 
 	librbd "github.com/ceph/go-ceph/rbd"
 )
-
-func (rv *rbdVolume) ResyncVol(localStatus librbd.SiteMirrorImageStatus, force bool) error {
-	if resyncRequired(localStatus) {
-		// If the force option is not set return the error message to retry
-		// with Force option.
-		if !force {
-			return fmt.Errorf("%w: image is in %q state, description (%s). Force resync to recover volume",
-				ErrFailedPrecondition, localStatus.State, localStatus.Description)
-		}
-		err := rv.resyncImage()
-		if err != nil {
-			return fmt.Errorf("%w: failed to resync image: %w", ErrResyncImageFailed, err)
-		}
-
-		// If we issued a resync, return a non-final error as image needs to be recreated
-		// locally. Caller retries till RBD syncs an initial version of the image to
-		// report its status in the resync request.
-		return fmt.Errorf("%w: awaiting initial resync due to split brain", ErrUnavailable)
-	}
-
-	return nil
-}
 
 // repairResyncedImageID updates the existing image ID with new one.
 func (rv *rbdVolume) RepairResyncedImageID(ctx context.Context, ready bool) error {
@@ -66,27 +45,12 @@ func (rv *rbdVolume) RepairResyncedImageID(ctx context.Context, ready bool) erro
 	return rv.repairImageID(ctx, j, true)
 }
 
-// resyncRequired returns true if local image is in split-brain state and image
-// needs resync.
-func resyncRequired(localStatus librbd.SiteMirrorImageStatus) bool {
-	// resync is required if the image is in error state or the description
-	// contains split-brain message.
-	// In some corner cases like `re-player shutdown` the local image will not
-	// be in an error state. It would be also worth considering the `description`
-	// field to make sure about split-brain.
-	if localStatus.State == librbd.MirrorImageStatusStateError ||
-		strings.Contains(localStatus.Description, "split-brain") {
-		return true
-	}
-
-	return false
-}
-
-func (rv *rbdVolume) DisableVolumeReplication(
-	mirroringInfo *librbd.MirrorImageInfo,
+func DisableVolumeReplication(mirror types.Mirror,
+	ctx context.Context,
+	primary,
 	force bool,
 ) error {
-	if !mirroringInfo.Primary {
+	if !primary {
 		// Return success if the below condition is met
 		// Local image is secondary
 		// Local image is in up+replaying state
@@ -99,29 +63,37 @@ func (rv *rbdVolume) DisableVolumeReplication(
 		// disabled the image on all the remote (secondary) clusters will get
 		// auto-deleted. This helps in garbage collecting the volume
 		// replication Kubernetes artifacts after failback operation.
-		localStatus, rErr := rv.GetLocalState()
+		sts, rErr := mirror.GetGlobalMirroringStatus(ctx)
 		if rErr != nil {
-			return fmt.Errorf("%w: %w", ErrFetchingLocalState, rErr)
+			return fmt.Errorf("failed to get global state: %w", rErr)
 		}
-		if localStatus.Up && localStatus.State == librbd.MirrorImageStatusStateReplaying {
+
+		localStatus, err := sts.GetLocalSiteStatus()
+		if err != nil {
+			return fmt.Errorf("failed to get local state: %w", ErrInvalidArgument)
+		}
+		if localStatus.IsUP() && localStatus.GetState() == librbd.MirrorImageStatusStateReplaying.String() {
 			return nil
 		}
 
 		return fmt.Errorf("%w: secondary image status is up=%t and state=%s",
-			ErrInvalidArgument, localStatus.Up, localStatus.State)
+			ErrInvalidArgument, localStatus.IsUP(), localStatus.GetState())
 	}
-	err := rv.DisableImageMirroring(force)
+	err := mirror.DisableMirroring(ctx, force)
 	if err != nil {
-		return fmt.Errorf("%w: %w", ErrDisableImageMirroringFailed, err)
+		return fmt.Errorf("failed to disable image mirroring: %w", err)
 	}
 	// the image state can be still disabling once we disable the mirroring
 	// check the mirroring is disabled or not
-	mirroringInfo, err = rv.GetImageMirroringInfo()
+	info, err := mirror.GetMirroringInfo(ctx)
 	if err != nil {
-		return fmt.Errorf("%w: %w", ErrFetchingMirroringInfo, err)
+		return fmt.Errorf("failed to get mirroring info of image: %w", err)
 	}
-	if mirroringInfo.State == librbd.MirrorImageDisabling {
-		return fmt.Errorf("%w: %q is in disabling state", ErrAborted, rv.VolID)
+
+	// error out if the image is not in disabled state.
+	if info.GetState() != librbd.MirrorImageDisabled.String() {
+		return fmt.Errorf("%w: image is in %q state, expected state %q", ErrAborted,
+			info.GetState(), librbd.MirrorImageDisabled.String())
 	}
 
 	return nil

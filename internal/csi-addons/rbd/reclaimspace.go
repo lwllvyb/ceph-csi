@@ -18,11 +18,13 @@ package rbd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	csicommon "github.com/ceph/ceph-csi/internal/csi-common"
 	rbdutil "github.com/ceph/ceph-csi/internal/rbd"
 	"github.com/ceph/ceph-csi/internal/util"
+	"github.com/ceph/ceph-csi/internal/util/log"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	rs "github.com/csi-addons/spec/lib/go/reclaimspace"
@@ -35,12 +37,13 @@ import (
 // of CSI-addons reclaimspace controller service spec.
 type ReclaimSpaceControllerServer struct {
 	*rs.UnimplementedReclaimSpaceControllerServer
+	volumeLocks *util.VolumeLocks
 }
 
-// NewReclaimSpaceControllerServer creates a new IdentityServer which handles
-// the Identity Service requests from the CSI-Addons specification.
-func NewReclaimSpaceControllerServer() *ReclaimSpaceControllerServer {
-	return &ReclaimSpaceControllerServer{}
+// NewReclaimSpaceControllerServer creates a new ReclaimSpaceControllerServer which handles
+// the ReclaimSpace Service requests from the CSI-Addons specification.
+func NewReclaimSpaceControllerServer(volumeLocks *util.VolumeLocks) *ReclaimSpaceControllerServer {
+	return &ReclaimSpaceControllerServer{volumeLocks: volumeLocks}
 }
 
 func (rscs *ReclaimSpaceControllerServer) RegisterService(server grpc.ServiceRegistrar) {
@@ -62,13 +65,27 @@ func (rscs *ReclaimSpaceControllerServer) ControllerReclaimSpace(
 	}
 	defer cr.DeleteCredentials()
 
+	if acquired := rscs.volumeLocks.TryAcquire(volumeID); !acquired {
+		log.ErrorLog(ctx, util.VolumeOperationAlreadyExistsFmt, volumeID)
+
+		return nil, status.Errorf(codes.Aborted, util.VolumeOperationAlreadyExistsFmt, volumeID)
+	}
+	defer rscs.volumeLocks.Release(volumeID)
+
 	rbdVol, err := rbdutil.GenVolFromVolID(ctx, volumeID, cr, req.GetSecrets())
 	if err != nil {
 		return nil, status.Errorf(codes.Aborted, "failed to find volume with ID %q: %s", volumeID, err.Error())
 	}
-	defer rbdVol.Destroy()
+	defer rbdVol.Destroy(ctx)
 
 	err = rbdVol.Sparsify()
+	if errors.Is(err, rbdutil.ErrImageInUse) {
+		// FIXME: https://github.com/csi-addons/kubernetes-csi-addons/issues/406.
+		// treat sparsify call as no-op if volume is in use.
+		log.DebugLog(ctx, fmt.Sprintf("volume with ID %q is in use, skipping sparsify operation", volumeID))
+
+		return &rs.ControllerReclaimSpaceResponse{}, nil
+	}
 	if err != nil {
 		// TODO: check for different error codes?
 		return nil, status.Errorf(codes.Internal, "failed to sparsify volume %q: %s", rbdVol, err.Error())
@@ -81,12 +98,13 @@ func (rscs *ReclaimSpaceControllerServer) ControllerReclaimSpace(
 // of CSI-addons reclaimspace controller service spec.
 type ReclaimSpaceNodeServer struct {
 	*rs.UnimplementedReclaimSpaceNodeServer
+	volumeLocks *util.VolumeLocks
 }
 
 // NewReclaimSpaceNodeServer creates a new IdentityServer which handles the
 // Identity Service requests from the CSI-Addons specification.
-func NewReclaimSpaceNodeServer() *ReclaimSpaceNodeServer {
-	return &ReclaimSpaceNodeServer{}
+func NewReclaimSpaceNodeServer(volumeLocks *util.VolumeLocks) *ReclaimSpaceNodeServer {
+	return &ReclaimSpaceNodeServer{volumeLocks: volumeLocks}
 }
 
 func (rsns *ReclaimSpaceNodeServer) RegisterService(server grpc.ServiceRegistrar) {
@@ -106,6 +124,13 @@ func (rsns *ReclaimSpaceNodeServer) NodeReclaimSpace(
 	if volumeID == "" {
 		return nil, status.Error(codes.InvalidArgument, "empty volume ID in request")
 	}
+
+	if acquired := rsns.volumeLocks.TryAcquire(volumeID); !acquired {
+		log.ErrorLog(ctx, util.VolumeOperationAlreadyExistsFmt, volumeID)
+
+		return nil, status.Errorf(codes.Aborted, util.VolumeOperationAlreadyExistsFmt, volumeID)
+	}
+	defer rsns.volumeLocks.Release(volumeID)
 
 	// path can either be the staging path on the node, or the volume path
 	// inside an application container

@@ -21,7 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"strconv"
+	"slices"
 	"strings"
 	"time"
 
@@ -91,25 +91,43 @@ var (
 	}
 )
 
+type deviceInfo interface {
+	GetName() string
+	GetPool() string
+	GetRadosNamespace() string
+	GetDevice() string
+}
+
 // rbdDeviceInfo strongly typed JSON spec for rbd device list output (of type krbd).
 type rbdDeviceInfo struct {
-	ID             string `json:"id"`
+	// Name will only be set for krbd devices (NBD uses Image)
+	Name string `json:"name"`
+	// Image will only be set for NBD devices (krbd uses Name)
+	Image string `json:"image"`
+
 	Pool           string `json:"pool"`
 	RadosNamespace string `json:"namespace"`
-	Name           string `json:"name"`
 	Device         string `json:"device"`
 }
 
-// nbdDeviceInfo strongly typed JSON spec for rbd-nbd device list output (of type nbd)
-// NOTE: There is a bug in rbd output that returns id as number for nbd, and string for krbd, thus
-// requiring 2 different JSON structures to unmarshal the output.
-// NOTE: image key is "name" in krbd output and "image" in nbd output, which is another difference.
-type nbdDeviceInfo struct {
-	ID             int64  `json:"id"`
-	Pool           string `json:"pool"`
-	RadosNamespace string `json:"namespace"`
-	Name           string `json:"image"`
-	Device         string `json:"device"`
+func (rdi *rbdDeviceInfo) GetName() string {
+	if rdi.Name != "" {
+		return rdi.Name
+	}
+
+	return rdi.Image
+}
+
+func (rdi *rbdDeviceInfo) GetPool() string {
+	return rdi.Pool
+}
+
+func (rdi *rbdDeviceInfo) GetRadosNamespace() string {
+	return rdi.RadosNamespace
+}
+
+func (rdi *rbdDeviceInfo) GetDevice() string {
+	return rdi.Device
 }
 
 type detachRBDImageArgs struct {
@@ -123,25 +141,29 @@ type detachRBDImageArgs struct {
 	logStrategy       string
 }
 
-// rbdGetDeviceList queries rbd about mapped devices and returns a list of rbdDeviceInfo
+// getDeviceList queries rbd about mapped devices and returns a list of deviceInfo
 // It will selectively list devices mapped using krbd or nbd as specified by accessType.
-func rbdGetDeviceList(ctx context.Context, accessType string) ([]rbdDeviceInfo, error) {
-	// rbd device list --format json --device-type [krbd|nbd]
+func getDeviceList(ctx context.Context, accessType string) ([]deviceInfo, error) {
 	var (
-		rbdDeviceList []rbdDeviceInfo
-		nbdDeviceList []nbdDeviceInfo
+		stdout string
+		err    error
 	)
 
-	stdout, _, err := util.ExecCommand(ctx, rbd, "device", "list", "--format="+"json", "--device-type", accessType)
-	if err != nil {
-		return nil, fmt.Errorf("error getting device list from rbd for devices of type (%s): %w", accessType, err)
+	if accessType == accessTypeKRbd {
+		// rbd device list --format json --device-type [krbd|nbd]
+		stdout, _, err = util.ExecCommand(ctx, rbd, "device", "list", "--format=json", "--device-type", accessType)
+		if err != nil {
+			return nil, fmt.Errorf("error getting device list from rbd for devices of type (%s): %w", accessType, err)
+		}
+	} else {
+		stdout, _, err = util.ExecCommand(ctx, "rbd-nbd", "list-mapped", "--format=json")
+		if err != nil {
+			return nil, fmt.Errorf("error getting device list from rbd-nbd for devices of type (%s): %w", accessType, err)
+		}
 	}
 
-	if accessType == accessTypeKRbd {
-		err = json.Unmarshal([]byte(stdout), &rbdDeviceList)
-	} else {
-		err = json.Unmarshal([]byte(stdout), &nbdDeviceList)
-	}
+	var devices []*rbdDeviceInfo
+	err = json.Unmarshal([]byte(stdout), &devices)
 	if err != nil {
 		return nil, fmt.Errorf(
 			"error to parse JSON output of device list for devices of type (%s): %w",
@@ -149,22 +171,13 @@ func rbdGetDeviceList(ctx context.Context, accessType string) ([]rbdDeviceInfo, 
 			err)
 	}
 
-	// convert output to a rbdDeviceInfo list for consumers
-	if accessType == accessTypeNbd {
-		for _, device := range nbdDeviceList {
-			rbdDeviceList = append(
-				rbdDeviceList,
-				rbdDeviceInfo{
-					ID:             strconv.FormatInt(device.ID, 10),
-					Pool:           device.Pool,
-					RadosNamespace: device.RadosNamespace,
-					Name:           device.Name,
-					Device:         device.Device,
-				})
-		}
+	// convert []rbdDeviceInfo to []deviceInfo
+	deviceList := make([]deviceInfo, len(devices))
+	for i := range devices {
+		deviceList[i] = devices[i]
 	}
 
-	return rbdDeviceList, nil
+	return deviceList, nil
 }
 
 // findDeviceMappingImage finds a devicePath, if available, based on image spec (pool/{namespace/}image) on the node.
@@ -179,16 +192,16 @@ func findDeviceMappingImage(ctx context.Context, pool, namespace, image string, 
 		imageSpec = fmt.Sprintf("%s/%s/%s", pool, namespace, image)
 	}
 
-	rbdDeviceList, err := rbdGetDeviceList(ctx, accessType)
+	deviceList, err := getDeviceList(ctx, accessType)
 	if err != nil {
 		log.WarningLog(ctx, "failed to determine if image (%s) is mapped to a device (%v)", imageSpec, err)
 
 		return "", false
 	}
 
-	for _, device := range rbdDeviceList {
-		if device.Name == image && device.Pool == pool && device.RadosNamespace == namespace {
-			return device.Device, true
+	for _, device := range deviceList {
+		if device.GetName() == image && device.GetPool() == pool && device.GetRadosNamespace() == namespace {
+			return device.GetDevice(), true
 		}
 	}
 
@@ -197,7 +210,7 @@ func findDeviceMappingImage(ctx context.Context, pool, namespace, image string, 
 
 // Stat a path, if it doesn't exist, retry maxRetries times.
 func waitForPath(ctx context.Context, pool, namespace, image string, maxRetries int, useNbdDriver bool) (string, bool) {
-	for i := 0; i < maxRetries; i++ {
+	for i := range maxRetries {
 		if i != 0 {
 			time.Sleep(time.Second)
 		}
@@ -216,7 +229,7 @@ func waitForPath(ctx context.Context, pool, namespace, image string, maxRetries 
 func SetRbdNbdToolFeatures() {
 	var stderr string
 	// check if the module is loaded or compiled in
-	_, err := os.Stat(fmt.Sprintf("/sys/module/%s", moduleNbd))
+	_, err := os.Stat("/sys/module/" + moduleNbd)
 	if os.IsNotExist(err) {
 		// try to load the module
 		_, stderr, err = util.ExecCommand(context.TODO(), "modprobe", moduleNbd)
@@ -295,7 +308,7 @@ func parseMapOptions(mapOptions string) (string, string, error) {
 
 // getMapOptions is a wrapper func, calls parse map/unmap funcs and feeds the
 // rbdVolume object.
-func getMapOptions(req *csi.NodeStageVolumeRequest, rv *rbdVolume) error {
+func (ns *NodeServer) getMapOptions(req *csi.NodeStageVolumeRequest, rv *rbdVolume) error {
 	krbdMapOptions, nbdMapOptions, err := parseMapOptions(req.GetVolumeContext()["mapOptions"])
 	if err != nil {
 		return err
@@ -311,6 +324,14 @@ func getMapOptions(req *csi.NodeStageVolumeRequest, rv *rbdVolume) error {
 		rv.MapOptions = nbdMapOptions
 		rv.UnmapOptions = nbdUnmapOptions
 	}
+
+	readAffinityMapOptions, err := util.GetReadAffinityMapOptions(
+		util.CsiConfigFile, rv.ClusterID, ns.CLIReadAffinityOptions, ns.NodeLabels,
+	)
+	if err != nil {
+		return err
+	}
+	rv.appendReadAffinityMapOptions(readAffinityMapOptions)
 
 	return nil
 }
@@ -333,7 +354,6 @@ func attachRBDImage(ctx context.Context, volOptions *rbdVolume, device string, c
 		}
 
 		err = waitForrbdImage(ctx, backoff, volOptions)
-
 		if err != nil {
 			return "", err
 		}
@@ -344,29 +364,27 @@ func attachRBDImage(ctx context.Context, volOptions *rbdVolume, device string, c
 }
 
 func appendNbdDeviceTypeAndOptions(cmdArgs []string, userOptions, cookie string) []string {
-	cmdArgs = append(cmdArgs, "--device-type", accessTypeNbd)
-
-	isUnmap := CheckSliceContains(cmdArgs, "unmap")
+	isUnmap := slices.Contains(cmdArgs, "unmap")
 	if !isUnmap {
 		if !strings.Contains(userOptions, useNbdNetlink) {
-			cmdArgs = append(cmdArgs, "--options", useNbdNetlink)
+			cmdArgs = append(cmdArgs, "--"+useNbdNetlink)
 		}
 		if !strings.Contains(userOptions, setNbdReattach) {
-			cmdArgs = append(cmdArgs, "--options", fmt.Sprintf("%s=%d", setNbdReattach, defaultNbdReAttachTimeout))
+			cmdArgs = append(cmdArgs, fmt.Sprintf("--%s=%d", setNbdReattach, defaultNbdReAttachTimeout))
 		}
 		if !strings.Contains(userOptions, setNbdIOTimeout) {
-			cmdArgs = append(cmdArgs, "--options", fmt.Sprintf("%s=%d", setNbdIOTimeout, defaultNbdIOTimeout))
+			cmdArgs = append(cmdArgs, fmt.Sprintf("--%s=%d", setNbdIOTimeout, defaultNbdIOTimeout))
 		}
 
 		if hasNBDCookieSupport {
-			cmdArgs = append(cmdArgs, "--options", fmt.Sprintf("cookie=%s", cookie))
+			cmdArgs = append(cmdArgs, "--cookie="+cookie)
 		}
 	}
 
 	if userOptions != "" {
 		// userOptions is appended after, possibly overriding the above
 		// default options.
-		cmdArgs = append(cmdArgs, "--options", userOptions)
+		cmdArgs = append(cmdArgs, "--"+userOptions)
 	}
 
 	return cmdArgs
@@ -391,7 +409,7 @@ func appendKRbdDeviceTypeAndOptions(cmdArgs []string, userOptions string) []stri
 // provided for rbd integrated cli to rbd-nbd cli format specific.
 func appendRbdNbdCliOptions(cmdArgs []string, userOptions, cookie string) []string {
 	if !strings.Contains(userOptions, useNbdNetlink) {
-		cmdArgs = append(cmdArgs, fmt.Sprintf("--%s", useNbdNetlink))
+		cmdArgs = append(cmdArgs, "--"+useNbdNetlink)
 	}
 	if !strings.Contains(userOptions, setNbdReattach) {
 		cmdArgs = append(cmdArgs, fmt.Sprintf("--%s=%d", setNbdReattach, defaultNbdReAttachTimeout))
@@ -400,12 +418,12 @@ func appendRbdNbdCliOptions(cmdArgs []string, userOptions, cookie string) []stri
 		cmdArgs = append(cmdArgs, fmt.Sprintf("--%s=%d", setNbdIOTimeout, defaultNbdIOTimeout))
 	}
 	if hasNBDCookieSupport {
-		cmdArgs = append(cmdArgs, fmt.Sprintf("--cookie=%s", cookie))
+		cmdArgs = append(cmdArgs, "--cookie="+cookie)
 	}
 	if userOptions != "" {
 		options := strings.Split(userOptions, ",")
 		for _, opt := range options {
-			cmdArgs = append(cmdArgs, fmt.Sprintf("--%s", opt))
+			cmdArgs = append(cmdArgs, "--"+opt)
 		}
 	}
 
@@ -428,13 +446,13 @@ func createPath(ctx context.Context, volOpt *rbdVolume, device string, cr *util.
 	if volOpt.Mounter == rbdTonbd && hasNBD {
 		isNbd = true
 	}
-
+	cli := rbd
 	if isNbd {
+		cli = rbdNbdMounter
 		mapArgs = append(mapArgs, "--log-file",
 			getCephClientLogFileName(volOpt.VolID, volOpt.LogDir, "rbd-nbd"))
 	}
 
-	cli := rbd
 	if device != "" {
 		// TODO: use rbd cli for attach/detach in the future
 		cli = rbdNbdMounter
@@ -548,7 +566,7 @@ func detachRBDImageOrDeviceSpec(
 
 			return err
 		}
-		if len(mapper) > 0 {
+		if mapper != "" {
 			// mapper found, so it is open Luks device
 			err = util.CloseEncryptedVolume(ctx, mapperFile)
 			if err != nil {
@@ -568,7 +586,13 @@ func detachRBDImageOrDeviceSpec(
 		unmapArgs = appendKRbdDeviceTypeAndOptions(unmapArgs, dArgs.unmapOptions)
 	}
 
-	_, stderr, err := util.ExecCommand(ctx, rbd, unmapArgs...)
+	var err error
+	var stderr string
+	if dArgs.isNbd {
+		_, stderr, err = util.ExecCommand(ctx, rbdTonbd, unmapArgs...)
+	} else {
+		_, stderr, err = util.ExecCommand(ctx, rbd, unmapArgs...)
+	}
 	if err != nil {
 		// Messages for krbd and nbd differ, hence checking either of them for missing mapping
 		// This is not applicable when a device path is passed in
