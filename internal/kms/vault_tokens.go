@@ -24,6 +24,7 @@ import (
 	"os"
 	"strconv"
 
+	"github.com/ceph/ceph-csi/internal/util/file"
 	"github.com/ceph/ceph-csi/internal/util/k8s"
 
 	"github.com/hashicorp/vault/api"
@@ -378,10 +379,11 @@ func (vtc *vaultTenantConnection) initCertificates(config map[string]interface{}
 				return fmt.Errorf("failed to get CA certificate from secret %s: %w", vaultCAFromSecret, cErr)
 			}
 		}
-		vaultConfig[api.EnvVaultCACert], err = createTempFile("vault-ca-cert", []byte(cert))
-		if err != nil {
-			return fmt.Errorf("failed to create temporary file for Vault CA: %w", err)
+		cer, ferr := file.CreateTempFile("vault-ca-cert", cert)
+		if ferr != nil {
+			return fmt.Errorf("failed to create temporary file for Vault CA: %w", ferr)
 		}
+		vaultConfig[api.EnvVaultCACert] = cer.Name()
 	}
 
 	vaultClientCertFromSecret := "" // optional
@@ -403,10 +405,11 @@ func (vtc *vaultTenantConnection) initCertificates(config map[string]interface{}
 				return fmt.Errorf("failed to get client certificate from secret %s: %w", vaultCAFromSecret, cErr)
 			}
 		}
-		vaultConfig[api.EnvVaultClientCert], err = createTempFile("vault-ca-cert", []byte(cert))
-		if err != nil {
-			return fmt.Errorf("failed to create temporary file for Vault client certificate: %w", err)
+		cer, ferr := file.CreateTempFile("vault-ca-cert", cert)
+		if ferr != nil {
+			return fmt.Errorf("failed to create temporary file for Vault client certificate: %w", ferr)
 		}
+		vaultConfig[api.EnvVaultClientCert] = cer.Name()
 	}
 
 	vaultClientCertKeyFromSecret := "" // optional
@@ -432,10 +435,11 @@ func (vtc *vaultTenantConnection) initCertificates(config map[string]interface{}
 				return fmt.Errorf("failed to get client certificate key from secret %s: %w", vaultCAFromSecret, err)
 			}
 		}
-		vaultConfig[api.EnvVaultClientKey], err = createTempFile("vault-client-cert-key", []byte(certKey))
+		ckey, err := file.CreateTempFile("vault-client-cert-key", certKey)
 		if err != nil {
 			return fmt.Errorf("failed to create temporary file for Vault client cert key: %w", err)
 		}
+		vaultConfig[api.EnvVaultClientKey] = ckey.Name()
 	}
 
 	for key, value := range vaultConfig {
@@ -459,8 +463,9 @@ func (vtc *vaultTenantConnection) getK8sClient() (*kubernetes.Clientset, error) 
 
 // FetchDEK returns passphrase from Vault. The passphrase is stored in a
 // data.data.passphrase structure.
-func (vtc *vaultTenantConnection) FetchDEK(key string) (string, error) {
-	s, err := vtc.secrets.GetSecret(key, vtc.keyContext)
+func (vtc *vaultTenantConnection) FetchDEK(ctx context.Context, key string) (string, error) {
+	// Since the second return variable loss.Version is not used, there it is ignored.
+	s, _, err := vtc.secrets.GetSecret(key, vtc.keyContext)
 	if err != nil {
 		return "", err
 	}
@@ -478,14 +483,15 @@ func (vtc *vaultTenantConnection) FetchDEK(key string) (string, error) {
 }
 
 // StoreDEK saves new passphrase in Vault.
-func (vtc *vaultTenantConnection) StoreDEK(key, value string) error {
+func (vtc *vaultTenantConnection) StoreDEK(ctx context.Context, key, value string) error {
 	data := map[string]interface{}{
 		"data": map[string]string{
 			"passphrase": value,
 		},
 	}
 
-	err := vtc.secrets.PutSecret(key, data, vtc.keyContext)
+	// Since the first return variable loss.Version is not used, there it is ignored.
+	_, err := vtc.secrets.PutSecret(key, data, vtc.keyContext)
 	if err != nil {
 		return fmt.Errorf("saving passphrase at %s request to vault failed: %w", key, err)
 	}
@@ -494,7 +500,7 @@ func (vtc *vaultTenantConnection) StoreDEK(key, value string) error {
 }
 
 // RemoveDEK deletes passphrase from Vault.
-func (vtc *vaultTenantConnection) RemoveDEK(key string) error {
+func (vtc *vaultTenantConnection) RemoveDEK(ctx context.Context, key string) error {
 	err := vtc.secrets.DeleteSecret(key, vtc.getDeleteKeyContext())
 	if err != nil {
 		return fmt.Errorf("delete passphrase at %s request to vault failed: %w", key, err)

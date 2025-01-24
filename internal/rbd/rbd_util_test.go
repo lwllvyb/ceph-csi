@@ -23,8 +23,11 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ceph/go-ceph/rados"
 	librbd "github.com/ceph/go-ceph/rbd"
-	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/ceph/ceph-csi/internal/util"
 )
 
 func TestHasSnapshotFeature(t *testing.T) {
@@ -165,11 +168,11 @@ func TestValidateImageFeatures(t *testing.T) {
 	for _, test := range tests {
 		err := test.rbdVol.validateImageFeatures(test.imageFeatures)
 		if test.isErr {
-			assert.EqualError(t, err, test.errMsg)
+			require.EqualError(t, err, test.errMsg)
 
 			continue
 		}
-		assert.Nil(t, err)
+		require.NoError(t, err)
 	}
 }
 
@@ -233,7 +236,6 @@ func TestGetCephClientLogFileName(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			val := getCephClientLogFileName(tt.args.id, tt.args.logDir, tt.args.prefix)
@@ -250,7 +252,7 @@ func TestStrategicActionOnLogFile(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	var logFile [3]string
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		f, err := os.CreateTemp(tmpDir, "rbd-*.log")
 		if err != nil {
 			t.Errorf("creating tempfile failed: %v", err)
@@ -289,7 +291,6 @@ func TestStrategicActionOnLogFile(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			strategicActionOnLogFile(ctx, tt.args.logStrategy, tt.args.logFile)
@@ -337,8 +338,7 @@ func TestIsKrbdFeatureSupported(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		tc := tt
-		t.Run(tc.name, func(t *testing.T) {
+		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			var err error
 			krbdSupportedFeaturesAttr := "0x1"
@@ -349,12 +349,12 @@ func TestIsKrbdFeatureSupported(t *testing.T) {
 			// In case /sys/bus/rbd/supported_features is absent and we are
 			// not in a position to prepare krbd feature attributes,
 			// isKrbdFeatureSupported returns error ErrNotExist
-			supported, err := isKrbdFeatureSupported(ctx, tc.featureName)
+			supported, err := isKrbdFeatureSupported(ctx, tt.featureName)
 			if err != nil && !errors.Is(err, os.ErrNotExist) {
-				t.Errorf("isKrbdFeatureSupported(%s) returned error: %v", tc.featureName, err)
-			} else if supported != tc.isSupported {
+				t.Errorf("isKrbdFeatureSupported(%s) returned error: %v", tt.featureName, err)
+			} else if supported != tt.isSupported {
 				t.Errorf("isKrbdFeatureSupported(%s) returned supported status, expected: %t, got: %t",
-					tc.featureName, tc.isSupported, supported)
+					tt.featureName, tt.isSupported, supported)
 			}
 		})
 	}
@@ -382,11 +382,61 @@ func Test_checkValidImageFeatures(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		tc := tt
-		t.Run(tc.name, func(t *testing.T) {
+		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			if got := checkValidImageFeatures(tc.imageFeatures, tc.ok); got != tc.want {
-				t.Errorf("checkValidImageFeatures() = %v, want %v", got, tc.want)
+			if got := checkValidImageFeatures(tt.imageFeatures, tt.ok); got != tt.want {
+				t.Errorf("checkValidImageFeatures() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_shouldRetryVolumeGeneration(t *testing.T) {
+	t.Parallel()
+	type args struct {
+		err error
+	}
+	tests := []struct {
+		name string
+		args args
+		want bool
+	}{
+		{
+			name: "No error (stop searching)",
+			args: args{err: nil},
+			want: false, // No error, stop searching
+		},
+		{
+			name: "ErrKeyNotFound (continue searching)",
+			args: args{err: util.ErrKeyNotFound},
+			want: true, // Known error, continue searching
+		},
+		{
+			name: "ErrPoolNotFound (continue searching)",
+			args: args{err: util.ErrPoolNotFound},
+			want: true, // Known error, continue searching
+		},
+		{
+			name: "ErrImageNotFound (continue searching)",
+			args: args{err: ErrImageNotFound},
+			want: true, // Known error, continue searching
+		},
+		{
+			name: "ErrPermissionDenied (continue searching)",
+			args: args{err: rados.ErrPermissionDenied},
+			want: true, // Known error, continue searching
+		},
+		{
+			name: "Different error (stop searching)",
+			args: args{err: errors.New("unknown error")},
+			want: false, // Unknown error, stop searching
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := shouldRetryVolumeGeneration(tt.args.err); got != tt.want {
+				t.Errorf("shouldRetryVolumeGeneration() = %v, want %v", got, tt.want)
 			}
 		})
 	}
