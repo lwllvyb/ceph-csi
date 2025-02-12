@@ -131,6 +131,10 @@ type Config struct {
 	// of this Ceph volume
 	csiImageIDKey string
 
+	// CSI GroupName is per Ceph volume object omap, contains the group ID of
+	// this Ceph volume
+	csiGroupIDKey string
+
 	// CSI image-name key in per Ceph volume object map, containing RBD image-name
 	// of this Ceph volume
 	csiImageKey string
@@ -174,6 +178,7 @@ func NewCSIVolumeJournal(suffix string) *Config {
 		cephSnapSourceKey:       "",
 		namespace:               "",
 		csiImageIDKey:           "csi.imageid",
+		csiGroupIDKey:           "csi.groupid",
 		encryptKMSKey:           "csi.volume.encryptKMS",
 		encryptionType:          "csi.volume.encryptionType",
 		ownerKey:                "csi.volume.owner",
@@ -194,6 +199,7 @@ func NewCSISnapshotJournal(suffix string) *Config {
 		cephSnapSourceKey:       "csi.source",
 		namespace:               "",
 		csiImageIDKey:           "csi.imageid",
+		csiGroupIDKey:           "csi.groupid",
 		encryptKMSKey:           "csi.volume.encryptKMS",
 		encryptionType:          "csi.volume.encryptionType",
 		ownerKey:                "csi.volume.owner",
@@ -387,8 +393,8 @@ func (conn *Connection) CheckReservation(ctx context.Context,
 		if savedImageAttributes.EncryptionType != encryptionType {
 			return nil, fmt.Errorf("internal state inconsistent, omap encryption type"+
 				" mismatch, request type %q(%d) volume UUID (%s) volume omap encryption type %q (%d)",
-				util.EncryptionTypeString(encryptionType), encryptionType,
-				objUUID, util.EncryptionTypeString(savedImageAttributes.EncryptionType),
+				encryptionType, encryptionType,
+				objUUID, savedImageAttributes.EncryptionType,
 				savedImageAttributes.EncryptionType)
 		}
 	}
@@ -642,7 +648,7 @@ func (conn *Connection) ReserveName(ctx context.Context,
 	// Update UUID directory to store encryption values
 	if kmsConf != "" {
 		omapValues[cj.encryptKMSKey] = kmsConf
-		omapValues[cj.encryptionType] = util.EncryptionTypeString(encryptionType)
+		omapValues[cj.encryptionType] = encryptionType.String()
 	}
 
 	// if owner is passed, set it in the UUID directory too
@@ -686,6 +692,7 @@ type ImageAttributes struct {
 	EncryptionType    util.EncryptionType // Type of encryption used, if image encrypted
 	Owner             string              // Contains the owner to be used in combination with KmsID (for some KMS)
 	ImageID           string              // Contains the image id
+	GroupID           string              // Contains the group id of the image
 	JournalPoolID     int64               // Pool ID of the CSI journal pool, stored in big endian format (on-disk data)
 	BackingSnapshotID string              // ID of the snapshot on which the CephFS snapshot-backed volume is based
 }
@@ -718,6 +725,7 @@ func (conn *Connection) GetImageAttributes(
 		cj.csiImageIDKey,
 		cj.ownerKey,
 		cj.backingSnapshotIDKey,
+		cj.csiGroupIDKey,
 	}
 	values, err := getOMapValues(
 		ctx, conn, pool, cj.namespace, cj.cephUUIDDirectoryPrefix+objectUUID,
@@ -736,6 +744,7 @@ func (conn *Connection) GetImageAttributes(
 	imageAttributes.Owner = values[cj.ownerKey]
 	imageAttributes.ImageID = values[cj.csiImageIDKey]
 	imageAttributes.BackingSnapshotID = values[cj.backingSnapshotIDKey]
+	imageAttributes.GroupID = values[cj.csiGroupIDKey]
 
 	// image key was added at a later point, so not all volumes will have this
 	// key set when ceph-csi was upgraded
@@ -790,6 +799,17 @@ func (conn *Connection) StoreAttribute(ctx context.Context, pool, reservedUUID, 
 		map[string]string{key: value})
 	if err != nil {
 		return fmt.Errorf("failed to set key %q to %q: %w", key, value, err)
+	}
+
+	return nil
+}
+
+// StoreGroupID stores an groupID in omap.
+func (conn *Connection) StoreGroupID(ctx context.Context, pool, reservedUUID, groupID string) error {
+	err := setOMapKeys(ctx, conn, pool, conn.config.namespace, conn.config.cephUUIDDirectoryPrefix+reservedUUID,
+		map[string]string{conn.config.csiGroupIDKey: groupID})
+	if err != nil {
+		return fmt.Errorf("failed to store groupID %w", err)
 	}
 
 	return nil

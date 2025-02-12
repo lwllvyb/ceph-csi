@@ -76,6 +76,10 @@ func validateRbdVol(rbdVol *rbdVolume) error {
 		return err
 	}
 
+	if err = validateNonEmptyField(rbdVol.JournalPool, "JournalPool", "rbdVolume"); err != nil {
+		return err
+	}
+
 	if err = validateNonEmptyField(rbdVol.ClusterID, "ClusterID", "rbdVolume"); err != nil {
 		return err
 	}
@@ -158,8 +162,8 @@ func checkSnapCloneExists(
 			snapData.ImagePool, rbdSnap.Pool)
 	}
 
-	vol := generateVolFromSnap(rbdSnap)
-	defer vol.Destroy()
+	vol := rbdSnap.toVolume()
+	defer vol.Destroy(ctx)
 	err = vol.Connect(cr)
 	if err != nil {
 		return false, err
@@ -192,7 +196,7 @@ func checkSnapCloneExists(
 	rbdSnap.VolSize = vol.VolSize
 	// found a snapshot already available, process and return its information
 	rbdSnap.VolID, err = util.GenerateVolID(ctx, rbdSnap.Monitors, cr, snapData.ImagePoolID, rbdSnap.Pool,
-		rbdSnap.ClusterID, snapUUID, volIDVersion)
+		rbdSnap.ClusterID, snapUUID)
 	if err != nil {
 		return false, err
 	}
@@ -290,7 +294,7 @@ func (rv *rbdVolume) Exists(ctx context.Context, parentVol *rbdVolume) (bool, er
 
 	// NOTE: Return volsize should be on-disk volsize, not request vol size, so
 	// save it for size checks before fetching image data
-	requestSize := rv.VolSize //nolint:ifshort // FIXME: rename and split function into helpers
+	requestSize := rv.VolSize
 	// Fetch on-disk image attributes and compare against request
 	err = rv.getImageInfo()
 	if err != nil {
@@ -328,13 +332,13 @@ func (rv *rbdVolume) Exists(ctx context.Context, parentVol *rbdVolume) (bool, er
 
 	// found a volume already available, process and return it!
 	rv.VolID, err = util.GenerateVolID(ctx, rv.Monitors, rv.conn.Creds, imageData.ImagePoolID, rv.Pool,
-		rv.ClusterID, rv.ReservedID, volIDVersion)
+		rv.ClusterID, rv.ReservedID)
 	if err != nil {
 		return false, err
 	}
 
 	if parentVol != nil {
-		err = parentVol.copyEncryptionConfig(&rv.rbdImage, true)
+		err = parentVol.copyEncryptionConfig(ctx, &rv.rbdImage, true)
 		if err != nil {
 			log.ErrorLog(ctx, err.Error())
 
@@ -348,29 +352,30 @@ func (rv *rbdVolume) Exists(ctx context.Context, parentVol *rbdVolume) (bool, er
 	return true, nil
 }
 
-// repairImageID checks if rv.ImageID is already available (if so, it was
+// repairImageID checks if ri.ImageID is already available (if so, it was
 // fetched from the journal), in case it is missing, the imageID is obtained
 // and stored in the journal.
 // if the force is set to true, the latest imageID will get added/updated in OMAP.
-func (rv *rbdVolume) repairImageID(ctx context.Context, j *journal.Connection, force bool) error {
+func (ri *rbdImage) repairImageID(ctx context.Context, j *journal.Connection, force bool) error {
 	if force {
 		// reset the imageID so that we can fetch latest imageID from ceph cluster.
-		rv.ImageID = ""
+		ri.ImageID = ""
 	}
 
-	if rv.ImageID != "" {
+	if ri.ImageID != "" {
 		return nil
 	}
 
-	err := rv.getImageID()
+	err := ri.getImageID()
 	if err != nil {
-		log.ErrorLog(ctx, "failed to get image id %s: %v", rv, err)
+		log.ErrorLog(ctx, "failed to get image id %s: %v", ri, err)
 
 		return err
 	}
-	err = j.StoreImageID(ctx, rv.JournalPool, rv.ReservedID, rv.ImageID)
+
+	err = j.StoreImageID(ctx, ri.JournalPool, ri.ReservedID, ri.ImageID)
 	if err != nil {
-		log.ErrorLog(ctx, "failed to store volume id %s: %v", rv, err)
+		log.ErrorLog(ctx, "failed to store volume id %s: %v", ri, err)
 
 		return err
 	}
@@ -382,6 +387,18 @@ func (rv *rbdVolume) repairImageID(ctx context.Context, j *journal.Connection, f
 // volume ID for the generated name.
 func reserveSnap(ctx context.Context, rbdSnap *rbdSnapshot, rbdVol *rbdVolume, cr *util.Credentials) error {
 	var err error
+
+	// restore original values in case of an error
+	origReservedID := rbdSnap.ReservedID
+	origRbdSnapName := rbdSnap.RbdSnapName
+	origVolID := rbdSnap.VolID
+	defer func() {
+		if err != nil {
+			rbdSnap.ReservedID = origReservedID
+			rbdSnap.RbdSnapName = origRbdSnapName
+			rbdSnap.VolID = origVolID
+		}
+	}()
 
 	journalPoolID, imagePoolID, err := util.GetPoolIDs(ctx, rbdSnap.Monitors, rbdSnap.JournalPool, rbdSnap.Pool, cr)
 	if err != nil {
@@ -400,12 +417,23 @@ func reserveSnap(ctx context.Context, rbdSnap *rbdSnapshot, rbdVol *rbdVolume, c
 		ctx, rbdSnap.JournalPool, journalPoolID, rbdSnap.Pool, imagePoolID,
 		rbdSnap.RequestName, rbdSnap.NamePrefix, rbdVol.RbdImageName, kmsID, rbdSnap.ReservedID, rbdVol.Owner,
 		"", encryptionType)
+	defer func() {
+		// only undo the reservation when an error occurred
+		if err == nil {
+			return
+		}
+
+		undoErr := undoSnapReservation(ctx, rbdSnap, cr)
+		if undoErr != nil {
+			log.WarningLog(ctx, "failed undoing reservation of snapshot %q: %v", rbdSnap, undoErr)
+		}
+	}()
 	if err != nil {
 		return err
 	}
 
 	rbdSnap.VolID, err = util.GenerateVolID(ctx, rbdSnap.Monitors, cr, imagePoolID, rbdSnap.Pool,
-		rbdSnap.ClusterID, rbdSnap.ReservedID, volIDVersion)
+		rbdSnap.ClusterID, rbdSnap.ReservedID)
 	if err != nil {
 		return err
 	}
@@ -433,6 +461,7 @@ func updateTopologyConstraints(rbdVol *rbdVolume, rbdSnap *rbdSnapshot) error {
 		if rbdVol.Topology != nil {
 			rbdVol.Pool = poolName
 			rbdVol.DataPool = dataPoolName
+			rbdVol.JournalPool = poolName
 		}
 
 		return nil
@@ -446,6 +475,7 @@ func updateTopologyConstraints(rbdVol *rbdVolume, rbdSnap *rbdSnapshot) error {
 		rbdVol.Pool = poolName
 		rbdVol.DataPool = dataPoolName
 		rbdVol.Topology = topology
+		rbdVol.JournalPool = poolName
 	}
 
 	return nil
@@ -453,13 +483,8 @@ func updateTopologyConstraints(rbdVol *rbdVolume, rbdSnap *rbdSnapshot) error {
 
 // reserveVol is a helper routine to request a rbdVolume name reservation and generate the
 // volume ID for the generated name.
-func reserveVol(ctx context.Context, rbdVol *rbdVolume, rbdSnap *rbdSnapshot, cr *util.Credentials) error {
+func reserveVol(ctx context.Context, rbdVol *rbdVolume, cr *util.Credentials) error {
 	var err error
-
-	err = updateTopologyConstraints(rbdVol, rbdSnap)
-	if err != nil {
-		return err
-	}
 
 	journalPoolID, imagePoolID, err := util.GetPoolIDs(ctx, rbdVol.Monitors, rbdVol.JournalPool, rbdVol.Pool, cr)
 	if err != nil {
@@ -482,7 +507,7 @@ func reserveVol(ctx context.Context, rbdVol *rbdVolume, rbdSnap *rbdSnapshot, cr
 	}
 
 	rbdVol.VolID, err = util.GenerateVolID(ctx, rbdVol.Monitors, cr, imagePoolID, rbdVol.Pool,
-		rbdVol.ClusterID, rbdVol.ReservedID, volIDVersion)
+		rbdVol.ClusterID, rbdVol.ReservedID)
 	if err != nil {
 		return err
 	}
@@ -546,7 +571,8 @@ func RegenerateJournal(
 	volumeID,
 	requestName,
 	owner,
-	clusterName string,
+	clusterName,
+	instanceID string,
 	setMetadata bool,
 	cr *util.Credentials,
 ) (string, error) {
@@ -573,12 +599,16 @@ func RegenerateJournal(
 
 	rbdVol.Owner = owner
 
-	kmsID, encryptionType, err = ParseEncryptionOpts(volumeAttributes, util.EncryptionTypeNone)
+	kmsID, encryptionType, err = ParseEncryptionOpts(volumeAttributes, rbdDefaultEncryptionType)
 	if err != nil {
 		return "", err
 	}
 
 	rbdVol.Monitors, rbdVol.ClusterID, err = util.FetchMappedClusterIDAndMons(ctx, vi.ClusterID)
+	if err != nil {
+		return "", err
+	}
+	rbdVol.RadosNamespace, err = util.GetRBDRadosNamespace(util.CsiConfigFile, rbdVol.ClusterID)
 	if err != nil {
 		return "", err
 	}
@@ -594,7 +624,7 @@ func RegenerateJournal(
 	if rbdVol.JournalPool == "" {
 		rbdVol.JournalPool = rbdVol.Pool
 	}
-	volJournal = journal.NewCSIVolumeJournal(CSIInstanceID)
+	volJournal = journal.NewCSIVolumeJournal(instanceID)
 	j, err := volJournal.Connect(rbdVol.Monitors, rbdVol.RadosNamespace, cr)
 	if err != nil {
 		return "", err
@@ -640,7 +670,7 @@ func RegenerateJournal(
 		}
 		// As the omap already exists for this image ID return nil.
 		rbdVol.VolID, err = util.GenerateVolID(ctx, rbdVol.Monitors, cr, imagePoolID, rbdVol.Pool,
-			rbdVol.ClusterID, rbdVol.ReservedID, volIDVersion)
+			rbdVol.ClusterID, rbdVol.ReservedID)
 		if err != nil {
 			return "", err
 		}
@@ -665,7 +695,7 @@ func RegenerateJournal(
 		}
 	}()
 	rbdVol.VolID, err = util.GenerateVolID(ctx, rbdVol.Monitors, cr, imagePoolID, rbdVol.Pool,
-		rbdVol.ClusterID, rbdVol.ReservedID, volIDVersion)
+		rbdVol.ClusterID, rbdVol.ReservedID)
 	if err != nil {
 		return "", err
 	}

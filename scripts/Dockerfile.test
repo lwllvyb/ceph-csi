@@ -23,6 +23,8 @@ ENV \
 
 COPY build.env /
 
+RUN mkdir -p /etc/selinux && touch /etc/selinux/config
+
 RUN source /build.env \
     && \
     ( test -n "${GOARCH}" && exit 0; echo -e "\n\nMissing GOARCH argument for building image, install Golang or run: make containerized-test GOARCH=amd64\n\n"; exit 1 ) \
@@ -32,8 +34,10 @@ RUN source /build.env \
 	gcc \
 	findutils \
 	librados-devel \
+        libcephfs-devel \
 	librbd-devel \
 	openssl \
+	ruby-devel \
 	rubygems \
 	ShellCheck \
 	codespell \
@@ -56,6 +60,7 @@ RUN source /build.env \
     && npm install @commitlint/cli@"${COMMITLINT_VERSION}" \
     && popd \
     && git config --global --add safe.directory ${CEPHCSIPATH} \
+    && go install github.com/augmentable-dev/tickgit/cmd/tickgit@latest \
     && true
 
 WORKDIR ${CEPHCSIPATH}

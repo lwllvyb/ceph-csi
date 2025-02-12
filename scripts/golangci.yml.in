@@ -1,5 +1,5 @@
 ---
-# https://github.com/golangci/golangci-lint/blob/master/.golangci.example.yml
+# https://github.com/golangci/golangci-lint/blob/master/.golangci.reference.yml
 # This file contains all available configuration options
 # with their default values.
 
@@ -12,7 +12,7 @@ run:
   concurrency: 4
 
   # timeout for analysis, e.g. 30s, 5m, default is 1m
-  deadline: 10m
+  timeout: 20m
 
   # exit code when at least one issue was found, default is 1
   issues-exit-code: 1
@@ -128,6 +128,10 @@ linters-settings:
       - dupImport  # https://github.com/go-critic/go-critic/issues/845
       # TODO: uncheckedInlineErr gives many false-positives
       - uncheckedInlineErr
+  gosec:
+    excludes:
+      # TODO: G115 gives many false-positives
+      - G115 # Potential integer overflow when converting between integer types
   unused:
     # treat code as a program (not a library) and report unused exported
     # identifiers; default is false.
@@ -197,6 +201,7 @@ linters:
     - wrapcheck
     # TODO: enable linters added in golangci-lint 1.43
     - contextcheck
+    - mnd
     - gomnd
     - ireturn
     - tagliatelle
@@ -208,3 +213,6 @@ linters:
     - containedctx
     # TODO: depguard requires a list of (un)acceptable imports
     - depguard
+    # TODO enable linters added in golangci-lint 1.60
+    - iface
+    - recvcheck

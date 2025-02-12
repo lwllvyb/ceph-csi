@@ -26,7 +26,10 @@ import (
 	"strings"
 	"time"
 
+	csicommon "github.com/ceph/ceph-csi/internal/csi-common"
+	"github.com/ceph/ceph-csi/internal/rbd"
 	corerbd "github.com/ceph/ceph-csi/internal/rbd"
+	"github.com/ceph/ceph-csi/internal/rbd/types"
 	"github.com/ceph/ceph-csi/internal/util"
 	"github.com/ceph/ceph-csi/internal/util/log"
 
@@ -50,6 +53,11 @@ const (
 	// imageMirrorModeJournal uses journaling to propagate RBD images between
 	// ceph clusters.
 	imageMirrorModeJournal imageMirroringMode = "journal"
+
+	// imageCreationTimeKey is the key to get/set the image creation timestamp
+	// on the image metadata. The key is starting with `.rbd` so that it will
+	// not get replicated to remote cluster.
+	imageCreationTimeKey = ".rbd.image.creation_time"
 )
 
 const (
@@ -69,6 +77,12 @@ const (
 	// (optional) StartTime is the time the snapshot schedule
 	// begins, can be specified using the ISO 8601 time format.
 	schedulingStartTimeKey = "schedulingStartTime"
+
+	// flattenModeKey to get the flattenMode from the parameters.
+	// (optional) flattenMode decides how to handle images with parent.
+	// (default) If set to "never", the image with parent will not be flattened.
+	// If set to "force", the image with parent will be flattened.
+	flattenModeKey = "flattenMode"
 )
 
 // ReplicationServer struct of rbd CSI driver with supported methods of Replication
@@ -81,12 +95,17 @@ type ReplicationServer struct {
 	*replication.UnimplementedControllerServer
 	// Embed ControllerServer as it implements helper functions
 	*corerbd.ControllerServer
+	// driverInstance is the unique ID for this CSI-driver deployment.
+	driverInstance string
 }
 
 // NewReplicationServer creates a new ReplicationServer which handles
 // the Replication Service requests from the CSI-Addons specification.
-func NewReplicationServer(c *corerbd.ControllerServer) *ReplicationServer {
-	return &ReplicationServer{ControllerServer: c}
+func NewReplicationServer(instanceID string, c *corerbd.ControllerServer) *ReplicationServer {
+	return &ReplicationServer{
+		ControllerServer: c,
+		driverInstance:   instanceID,
+	}
 }
 
 func (rs *ReplicationServer) RegisterService(server grpc.ServiceRegistrar) {
@@ -104,10 +123,31 @@ func getForceOption(ctx context.Context, parameters map[string]string) (bool, er
 	}
 	force, err := strconv.ParseBool(val)
 	if err != nil {
-		return false, status.Errorf(codes.Internal, err.Error())
+		return false, status.Error(codes.Internal, err.Error())
 	}
 
 	return force, nil
+}
+
+// getFlattenMode gets flatten mode from the input GRPC request parameters.
+// flattenMode is the key to check the mode in the parameters.
+func getFlattenMode(ctx context.Context, parameters map[string]string) (types.FlattenMode, error) {
+	val, ok := parameters[flattenModeKey]
+	if !ok {
+		log.DebugLog(ctx, "%q is not set in parameters, setting to default (%v)",
+			flattenModeKey, types.FlattenModeNever)
+
+		return types.FlattenModeNever, nil
+	}
+
+	mode := types.FlattenMode(val)
+	switch mode {
+	case types.FlattenModeForce, types.FlattenModeNever:
+		return mode, nil
+	}
+	log.ErrorLog(ctx, "%q=%q is not supported", flattenModeKey, val)
+
+	return mode, status.Errorf(codes.InvalidArgument, "%q=%q is not supported", flattenModeKey, val)
 }
 
 // getMirroringMode gets the mirroring mode from the input GRPC request parameters.
@@ -215,7 +255,7 @@ func validateSchedulingInterval(interval string) error {
 func (rs *ReplicationServer) EnableVolumeReplication(ctx context.Context,
 	req *replication.EnableVolumeReplicationRequest,
 ) (*replication.EnableVolumeReplicationResponse, error) {
-	volumeID := req.GetVolumeId()
+	volumeID := csicommon.GetIDFromReplication(req)
 	if volumeID == "" {
 		return nil, status.Error(codes.InvalidArgument, "empty volume ID in request")
 	}
@@ -237,35 +277,43 @@ func (rs *ReplicationServer) EnableVolumeReplication(ctx context.Context,
 	}
 	defer rs.VolumeLocks.Release(volumeID)
 
-	rbdVol, err := corerbd.GenVolFromVolID(ctx, volumeID, cr, req.GetSecrets())
-	defer rbdVol.Destroy()
-	if err != nil {
-		switch {
-		case errors.Is(err, corerbd.ErrImageNotFound):
-			err = status.Errorf(codes.NotFound, "volume %s not found", volumeID)
-		case errors.Is(err, util.ErrPoolNotFound):
-			err = status.Errorf(codes.NotFound, "pool %s not found for %s", rbdVol.Pool, volumeID)
-		default:
-			err = status.Errorf(codes.Internal, err.Error())
-		}
+	mgr := rbd.NewManager(rs.driverInstance, req.GetParameters(), req.GetSecrets())
+	defer mgr.Destroy(ctx)
 
-		return nil, err
+	rbdVol, err := mgr.GetVolumeByID(ctx, volumeID)
+	if err != nil {
+		return nil, getGRPCError(err)
 	}
+	mirror, err := rbdVol.ToMirror()
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
 	// extract the mirroring mode
 	mirroringMode, err := getMirroringMode(ctx, req.GetParameters())
 	if err != nil {
 		return nil, err
 	}
+	// extract the flatten mode
+	flattenMode, err := getFlattenMode(ctx, req.GetParameters())
+	if err != nil {
+		return nil, err
+	}
 
-	mirroringInfo, err := rbdVol.GetImageMirroringInfo()
+	info, err := mirror.GetMirroringInfo(ctx)
 	if err != nil {
 		log.ErrorLog(ctx, err.Error())
 
 		return nil, status.Error(codes.Internal, err.Error())
 	}
+	if info.GetState() != librbd.MirrorImageEnabled.String() {
+		err = rbdVol.HandleParentImageExistence(ctx, flattenMode)
+		if err != nil {
+			log.ErrorLog(ctx, err.Error())
 
-	if mirroringInfo.State != librbd.MirrorImageEnabled {
-		err = rbdVol.EnableImageMirroring(mirroringMode)
+			return nil, getGRPCError(err)
+		}
+		err = mirror.EnableMirroring(ctx, mirroringMode)
 		if err != nil {
 			log.ErrorLog(ctx, err.Error())
 
@@ -282,7 +330,7 @@ func (rs *ReplicationServer) EnableVolumeReplication(ctx context.Context,
 func (rs *ReplicationServer) DisableVolumeReplication(ctx context.Context,
 	req *replication.DisableVolumeReplicationRequest,
 ) (*replication.DisableVolumeReplicationResponse, error) {
-	volumeID := req.GetVolumeId()
+	volumeID := csicommon.GetIDFromReplication(req)
 	if volumeID == "" {
 		return nil, status.Error(codes.InvalidArgument, "empty volume ID in request")
 	}
@@ -299,48 +347,45 @@ func (rs *ReplicationServer) DisableVolumeReplication(ctx context.Context,
 	}
 	defer rs.VolumeLocks.Release(volumeID)
 
-	rbdVol, err := corerbd.GenVolFromVolID(ctx, volumeID, cr, req.GetSecrets())
-	defer rbdVol.Destroy()
-	if err != nil {
-		switch {
-		case errors.Is(err, corerbd.ErrImageNotFound):
-			err = status.Errorf(codes.NotFound, "volume %s not found", volumeID)
-		case errors.Is(err, util.ErrPoolNotFound):
-			err = status.Errorf(codes.NotFound, "pool %s not found for %s", rbdVol.Pool, volumeID)
-		default:
-			err = status.Errorf(codes.Internal, err.Error())
-		}
+	mgr := rbd.NewManager(rs.driverInstance, req.GetParameters(), req.GetSecrets())
+	defer mgr.Destroy(ctx)
 
-		return nil, err
+	rbdVol, err := mgr.GetVolumeByID(ctx, volumeID)
+	if err != nil {
+		return nil, getGRPCError(err)
 	}
+	mirror, err := rbdVol.ToMirror()
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
 	// extract the force option
 	force, err := getForceOption(ctx, req.GetParameters())
 	if err != nil {
 		return nil, err
 	}
 
-	mirroringInfo, err := rbdVol.GetImageMirroringInfo()
+	info, err := mirror.GetMirroringInfo(ctx)
 	if err != nil {
 		log.ErrorLog(ctx, err.Error())
 
 		return nil, status.Error(codes.Internal, err.Error())
 	}
-
-	switch mirroringInfo.State {
+	switch info.GetState() {
 	// image is already in disabled state
-	case librbd.MirrorImageDisabled:
+	case librbd.MirrorImageDisabled.String():
 	// image mirroring is still disabling
-	case librbd.MirrorImageDisabling:
+	case librbd.MirrorImageDisabling.String():
 		return nil, status.Errorf(codes.Aborted, "%s is in disabling state", volumeID)
-	case librbd.MirrorImageEnabled:
-		err = rbdVol.DisableVolumeReplication(mirroringInfo, force)
+	case librbd.MirrorImageEnabled.String():
+		err = corerbd.DisableVolumeReplication(mirror, ctx, info.IsPrimary(), force)
 		if err != nil {
 			return nil, getGRPCError(err)
 		}
 
 		return &replication.DisableVolumeReplicationResponse{}, nil
 	default:
-		return nil, status.Errorf(codes.InvalidArgument, "image is in %s Mode", mirroringInfo.State)
+		return nil, status.Errorf(codes.InvalidArgument, "image is in %s Mode", info.GetState())
 	}
 
 	return &replication.DisableVolumeReplicationResponse{}, nil
@@ -353,7 +398,7 @@ func (rs *ReplicationServer) DisableVolumeReplication(ctx context.Context,
 func (rs *ReplicationServer) PromoteVolume(ctx context.Context,
 	req *replication.PromoteVolumeRequest,
 ) (*replication.PromoteVolumeResponse, error) {
-	volumeID := req.GetVolumeId()
+	volumeID := csicommon.GetIDFromReplication(req)
 	if volumeID == "" {
 		return nil, status.Error(codes.InvalidArgument, "empty volume ID in request")
 	}
@@ -370,44 +415,41 @@ func (rs *ReplicationServer) PromoteVolume(ctx context.Context,
 	}
 	defer rs.VolumeLocks.Release(volumeID)
 
-	rbdVol, err := corerbd.GenVolFromVolID(ctx, volumeID, cr, req.GetSecrets())
-	defer rbdVol.Destroy()
-	if err != nil {
-		switch {
-		case errors.Is(err, corerbd.ErrImageNotFound):
-			err = status.Errorf(codes.NotFound, "volume %s not found", volumeID)
-		case errors.Is(err, util.ErrPoolNotFound):
-			err = status.Errorf(codes.NotFound, "pool %s not found for %s", rbdVol.Pool, volumeID)
-		default:
-			err = status.Errorf(codes.Internal, err.Error())
-		}
+	mgr := rbd.NewManager(rs.driverInstance, req.GetParameters(), req.GetSecrets())
+	defer mgr.Destroy(ctx)
 
-		return nil, err
+	rbdVol, err := mgr.GetVolumeByID(ctx, volumeID)
+	if err != nil {
+		return nil, getGRPCError(err)
+	}
+	mirror, err := rbdVol.ToMirror()
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
 	}
 
-	mirroringInfo, err := rbdVol.GetImageMirroringInfo()
+	info, err := mirror.GetMirroringInfo(ctx)
 	if err != nil {
 		log.ErrorLog(ctx, err.Error())
 
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 
-	if mirroringInfo.State != librbd.MirrorImageEnabled {
+	if info.GetState() != librbd.MirrorImageEnabled.String() {
 		return nil, status.Errorf(
 			codes.InvalidArgument,
-			"mirroring is not enabled on %s, image is in %d Mode",
-			rbdVol.VolID,
-			mirroringInfo.State)
+			"mirroring is not enabled on %s, image is in %s Mode",
+			volumeID,
+			info.GetState())
 	}
 
 	// promote secondary to primary
-	if !mirroringInfo.Primary {
+	if !info.IsPrimary() {
 		if req.GetForce() {
 			// workaround for https://github.com/ceph/ceph-csi/issues/2736
 			// TODO: remove this workaround when the issue is fixed
-			err = rbdVol.ForcePromoteImage(cr)
+			err = mirror.ForcePromote(ctx, cr)
 		} else {
-			err = rbdVol.PromoteImage(req.GetForce())
+			err = mirror.Promote(ctx, req.GetForce())
 		}
 		if err != nil {
 			log.ErrorLog(ctx, err.Error())
@@ -427,7 +469,7 @@ func (rs *ReplicationServer) PromoteVolume(ctx context.Context,
 
 	interval, startTime := getSchedulingDetails(req.GetParameters())
 	if interval != admin.NoInterval {
-		err = rbdVol.AddSnapshotScheduling(interval, startTime)
+		err = mirror.AddSnapshotScheduling(interval, startTime)
 		if err != nil {
 			return nil, err
 		}
@@ -449,7 +491,7 @@ func (rs *ReplicationServer) PromoteVolume(ctx context.Context,
 func (rs *ReplicationServer) DemoteVolume(ctx context.Context,
 	req *replication.DemoteVolumeRequest,
 ) (*replication.DemoteVolumeResponse, error) {
-	volumeID := req.GetVolumeId()
+	volumeID := csicommon.GetIDFromReplication(req)
 	if volumeID == "" {
 		return nil, status.Error(codes.InvalidArgument, "empty volume ID in request")
 	}
@@ -466,38 +508,55 @@ func (rs *ReplicationServer) DemoteVolume(ctx context.Context,
 	}
 	defer rs.VolumeLocks.Release(volumeID)
 
-	rbdVol, err := corerbd.GenVolFromVolID(ctx, volumeID, cr, req.GetSecrets())
-	defer rbdVol.Destroy()
-	if err != nil {
-		switch {
-		case errors.Is(err, corerbd.ErrImageNotFound):
-			err = status.Errorf(codes.NotFound, "volume %s not found", volumeID)
-		case errors.Is(err, util.ErrPoolNotFound):
-			err = status.Errorf(codes.NotFound, "pool %s not found for %s", rbdVol.Pool, volumeID)
-		default:
-			err = status.Errorf(codes.Internal, err.Error())
-		}
+	mgr := rbd.NewManager(rs.driverInstance, req.GetParameters(), req.GetSecrets())
+	defer mgr.Destroy(ctx)
 
-		return nil, err
+	rbdVol, err := mgr.GetVolumeByID(ctx, volumeID)
+	if err != nil {
+		return nil, getGRPCError(err)
 	}
-	mirroringInfo, err := rbdVol.GetImageMirroringInfo()
+	mirror, err := rbdVol.ToMirror()
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
+	creationTime, err := rbdVol.GetCreationTime(ctx)
 	if err != nil {
 		log.ErrorLog(ctx, err.Error())
 
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 
-	if mirroringInfo.State != librbd.MirrorImageEnabled {
+	info, err := mirror.GetMirroringInfo(ctx)
+	if err != nil {
+		log.ErrorLog(ctx, err.Error())
+
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
+	if info.GetState() != librbd.MirrorImageEnabled.String() {
 		return nil, status.Errorf(
 			codes.InvalidArgument,
-			"mirroring is not enabled on %s, image is in %d Mode",
-			rbdVol.VolID,
-			mirroringInfo.State)
+			"mirroring is not enabled on %s, image is in %s Mode",
+			volumeID,
+			info.GetState())
 	}
 
 	// demote image to secondary
-	if mirroringInfo.Primary {
-		err = rbdVol.DemoteImage()
+	if info.IsPrimary() {
+		// store the image creation time for resync
+		_, err = rbdVol.GetMetadata(imageCreationTimeKey)
+		if err != nil && errors.Is(err, librbd.ErrNotFound) {
+			log.DebugLog(ctx, "setting image creation time %s for %s", creationTime, rbdVol)
+			err = rbdVol.SetMetadata(imageCreationTimeKey, timestampToString(creationTime))
+		}
+		if err != nil {
+			log.ErrorLog(ctx, err.Error())
+
+			return nil, status.Error(codes.Internal, err.Error())
+		}
+
+		err = mirror.Demote(ctx)
 		if err != nil {
 			log.ErrorLog(ctx, err.Error())
 
@@ -510,22 +569,22 @@ func (rs *ReplicationServer) DemoteVolume(ctx context.Context,
 
 // checkRemoteSiteStatus checks the state of the remote cluster.
 // It returns true if the state of the remote cluster is up and unknown.
-func checkRemoteSiteStatus(ctx context.Context, mirrorStatus *librbd.GlobalMirrorImageStatus) bool {
+func checkRemoteSiteStatus(ctx context.Context, mirrorStatus []types.SiteStatus) bool {
 	ready := true
 	found := false
-	for _, s := range mirrorStatus.SiteStatuses {
+	for _, s := range mirrorStatus {
 		log.UsefulLog(
 			ctx,
 			"peer site mirrorUUID=%q, daemon up=%t, mirroring state=%q, description=%q and lastUpdate=%d",
-			s.MirrorUUID,
-			s.Up,
-			s.State,
-			s.Description,
-			s.LastUpdate)
-		if s.MirrorUUID != "" {
+			s.GetMirrorUUID(),
+			s.IsUP(),
+			s.GetState(),
+			s.GetDescription(),
+			s.GetLastUpdate())
+		if s.GetMirrorUUID() != "" {
 			found = true
 			// If ready is already "false" do not flip it based on another remote peer status
-			if ready && (s.State != librbd.MirrorImageStatusStateUnknown || !s.Up) {
+			if ready && (s.GetState() != librbd.MirrorImageStatusStateUnknown.String() || !s.IsUP()) {
 				ready = false
 			}
 		}
@@ -538,10 +597,12 @@ func checkRemoteSiteStatus(ctx context.Context, mirrorStatus *librbd.GlobalMirro
 // ResyncVolume extracts the RBD volume information from the volumeID, If the
 // image is present, mirroring is enabled and the image is in demoted state.
 // If yes it will resync the image to correct the split-brain.
+//
+//nolint:gocyclo,cyclop // TODO: reduce complexity
 func (rs *ReplicationServer) ResyncVolume(ctx context.Context,
 	req *replication.ResyncVolumeRequest,
 ) (*replication.ResyncVolumeResponse, error) {
-	volumeID := req.GetVolumeId()
+	volumeID := csicommon.GetIDFromReplication(req)
 	if volumeID == "" {
 		return nil, status.Error(codes.InvalidArgument, "empty volume ID in request")
 	}
@@ -557,22 +618,19 @@ func (rs *ReplicationServer) ResyncVolume(ctx context.Context,
 		return nil, status.Errorf(codes.Aborted, util.VolumeOperationAlreadyExistsFmt, volumeID)
 	}
 	defer rs.VolumeLocks.Release(volumeID)
-	rbdVol, err := corerbd.GenVolFromVolID(ctx, volumeID, cr, req.GetSecrets())
-	defer rbdVol.Destroy()
-	if err != nil {
-		switch {
-		case errors.Is(err, corerbd.ErrImageNotFound):
-			err = status.Errorf(codes.NotFound, "volume %s not found", volumeID)
-		case errors.Is(err, util.ErrPoolNotFound):
-			err = status.Errorf(codes.NotFound, "pool %s not found for %s", rbdVol.Pool, volumeID)
-		default:
-			err = status.Errorf(codes.Internal, err.Error())
-		}
+	mgr := rbd.NewManager(rs.driverInstance, req.GetParameters(), req.GetSecrets())
+	defer mgr.Destroy(ctx)
 
-		return nil, err
+	rbdVol, err := mgr.GetVolumeByID(ctx, volumeID)
+	if err != nil {
+		return nil, getGRPCError(err)
+	}
+	mirror, err := rbdVol.ToMirror()
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
 	}
 
-	mirroringInfo, err := rbdVol.GetImageMirroringInfo()
+	info, err := mirror.GetMirroringInfo(ctx)
 	if err != nil {
 		// in case of Resync the image will get deleted and gets recreated and
 		// it takes time for this operation.
@@ -581,22 +639,22 @@ func (rs *ReplicationServer) ResyncVolume(ctx context.Context,
 		return nil, status.Error(codes.Aborted, err.Error())
 	}
 
-	if mirroringInfo.State != librbd.MirrorImageEnabled {
+	if info.GetState() != librbd.MirrorImageEnabled.String() {
 		return nil, status.Error(codes.InvalidArgument, "image mirroring is not enabled")
 	}
 
 	// return error if the image is still primary
-	if mirroringInfo.Primary {
+	if info.IsPrimary() {
 		return nil, status.Error(codes.InvalidArgument, "image is in primary state")
 	}
 
-	mirrorStatus, err := rbdVol.GetImageMirroringStatus()
+	sts, err := mirror.GetGlobalMirroringStatus(ctx)
 	if err != nil {
 		// the image gets recreated after issuing resync
 		if errors.Is(err, corerbd.ErrImageNotFound) {
 			// caller retries till RBD syncs an initial version of the image to
 			// report its status in the resync call. Ideally, this line will not
-			// be executed as the error would get returned due to getImageMirroringInfo
+			// be executed as the error would get returned due to getMirroringInfo
 			// failing to find an image above.
 			return nil, status.Error(codes.Aborted, err.Error())
 		}
@@ -606,22 +664,20 @@ func (rs *ReplicationServer) ResyncVolume(ctx context.Context,
 	}
 	ready := false
 
-	localStatus, err := mirrorStatus.LocalStatus()
+	localStatus, err := sts.GetLocalSiteStatus()
 	if err != nil {
 		log.ErrorLog(ctx, err.Error())
 
 		return nil, fmt.Errorf("failed to get local status: %w", err)
 	}
 
-	// convert the last update time to UTC
-	lastUpdateTime := time.Unix(localStatus.LastUpdate, 0).UTC()
 	log.UsefulLog(
 		ctx,
 		"local status: daemon up=%t, image mirroring state=%q, description=%q and lastUpdate=%s",
-		localStatus.Up,
-		localStatus.State,
-		localStatus.Description,
-		lastUpdateTime)
+		localStatus.IsUP(),
+		localStatus.GetState(),
+		localStatus.GetDescription(),
+		localStatus.GetLastUpdate())
 
 	//  To recover from split brain (up+error) state the image need to be
 	//  demoted and requested for resync on site-a and then the image on site-b
@@ -633,18 +689,48 @@ func (rs *ReplicationServer) ResyncVolume(ctx context.Context,
 	// If the image state on both the sites are up+unknown consider that
 	// complete data is synced as the last snapshot
 	// gets exchanged between the clusters.
-	if localStatus.State == librbd.MirrorImageStatusStateUnknown && localStatus.Up {
-		ready = checkRemoteSiteStatus(ctx, mirrorStatus)
+	if localStatus.GetState() == librbd.MirrorImageStatusStateUnknown.String() && localStatus.IsUP() {
+		ready = checkRemoteSiteStatus(ctx, sts.GetAllSitesStatus())
 	}
 
-	err = rbdVol.ResyncVol(localStatus, req.Force)
+	creationTime, err := rbdVol.GetCreationTime(ctx)
 	if err != nil {
-		return nil, getGRPCError(err)
+		return nil, status.Errorf(codes.Internal, "failed to get image info for %s: %s", rbdVol, err.Error())
 	}
 
-	err = checkVolumeResyncStatus(localStatus)
-	if err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
+	// image creation time is stored in the image metadata. it looks like
+	// `"seconds:1692879841 nanos:631526669"`
+	// If the image gets resynced the local image creation time will be
+	// lost, if the keys is not present in the image metadata then we can
+	// assume that the image is already resynced.
+	savedImageTime, err := rbdVol.GetMetadata(imageCreationTimeKey)
+	if err != nil && !errors.Is(err, librbd.ErrNotFound) {
+		return nil, status.Errorf(codes.Internal,
+			"failed to get %s key from image metadata for %s: %s",
+			imageCreationTimeKey,
+			rbdVol,
+			err.Error())
+	}
+
+	if savedImageTime != "" {
+		st, sErr := timestampFromString(savedImageTime)
+		if sErr != nil {
+			return nil, status.Errorf(codes.Internal, "failed to parse image creation time: %s", sErr.Error())
+		}
+		log.DebugLog(ctx, "image %s, savedImageTime=%v, currentImageTime=%v", rbdVol, st, creationTime)
+		if req.GetForce() && st.Equal(*creationTime) {
+			err = mirror.Resync(ctx)
+			if err != nil {
+				return nil, getGRPCError(err)
+			}
+		}
+	}
+
+	if !ready {
+		err = checkVolumeResyncStatus(ctx, localStatus)
+		if err != nil {
+			return nil, status.Error(codes.Internal, err.Error())
+		}
 	}
 
 	err = rbdVol.RepairResyncedImageID(ctx, ready)
@@ -659,20 +745,53 @@ func (rs *ReplicationServer) ResyncVolume(ctx context.Context,
 	return resp, nil
 }
 
+// timestampToString converts the time.Time object to string.
+func timestampToString(st *time.Time) string {
+	return fmt.Sprintf("seconds:%d nanos:%d", st.Unix(), st.Nanosecond())
+}
+
+// timestampFromString parses the timestamp string and returns the time.Time
+// object.
+func timestampFromString(timestamp string) (time.Time, error) {
+	st := time.Time{}
+	parts := strings.Fields(timestamp)
+	if len(parts) != 2 {
+		return st, fmt.Errorf("failed to parse image creation time: %s", timestamp)
+	}
+	if len(strings.Split(parts[0], ":")) != 2 || len(strings.Split(parts[1], ":")) != 2 {
+		return st, fmt.Errorf("failed to parse image creation time: %s", timestamp)
+	}
+	secondsStr := strings.Split(parts[0], ":")[1]
+	nanosStr := strings.Split(parts[1], ":")[1]
+
+	seconds, err := strconv.ParseInt(secondsStr, 10, 64)
+	if err != nil {
+		return st, fmt.Errorf("failed to parse image creation time seconds: %s", err.Error())
+	}
+
+	nanos, err := strconv.ParseInt(nanosStr, 10, 32)
+	if err != nil {
+		return st, fmt.Errorf("failed to parse image creation time nenos: %s", err.Error())
+	}
+
+	st = time.Unix(seconds, nanos)
+
+	return st, nil
+}
+
 func getGRPCError(err error) error {
 	if err == nil {
 		return status.Error(codes.OK, codes.OK.String())
 	}
 
 	errorStatusMap := map[error]codes.Code{
-		corerbd.ErrFetchingLocalState:          codes.Internal,
-		corerbd.ErrResyncImageFailed:           codes.Internal,
-		corerbd.ErrDisableImageMirroringFailed: codes.Internal,
-		corerbd.ErrFetchingMirroringInfo:       codes.Internal,
-		corerbd.ErrInvalidArgument:             codes.InvalidArgument,
-		corerbd.ErrAborted:                     codes.Aborted,
-		corerbd.ErrFailedPrecondition:          codes.FailedPrecondition,
-		corerbd.ErrUnavailable:                 codes.Unavailable,
+		corerbd.ErrImageNotFound:      codes.NotFound,
+		util.ErrPoolNotFound:          codes.NotFound,
+		corerbd.ErrInvalidArgument:    codes.InvalidArgument,
+		corerbd.ErrFlattenInProgress:  codes.Aborted,
+		corerbd.ErrAborted:            codes.Aborted,
+		corerbd.ErrFailedPrecondition: codes.FailedPrecondition,
+		corerbd.ErrUnavailable:        codes.Unavailable,
 	}
 
 	for e, code := range errorStatusMap {
@@ -681,8 +800,8 @@ func getGRPCError(err error) error {
 		}
 	}
 
-	// Handle any other non nil error not listed in the map
-	return status.Error(codes.Unknown, err.Error())
+	// Handle any other non nil error not listed in the map as internal error
+	return status.Error(codes.Internal, err.Error())
 }
 
 // GetVolumeReplicationInfo extracts the RBD volume information from the volumeID, If the
@@ -690,12 +809,14 @@ func getGRPCError(err error) error {
 func (rs *ReplicationServer) GetVolumeReplicationInfo(ctx context.Context,
 	req *replication.GetVolumeReplicationInfoRequest,
 ) (*replication.GetVolumeReplicationInfoResponse, error) {
-	volumeID := req.GetVolumeId()
+	volumeID := csicommon.GetIDFromReplication(req)
 	if volumeID == "" {
 		return nil, status.Error(codes.InvalidArgument, "empty volume ID in request")
 	}
 	cr, err := util.NewUserCredentials(req.GetSecrets())
 	if err != nil {
+		log.ErrorLog(ctx, "failed to get user credentials: %v", err)
+
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 	defer cr.DeleteCredentials()
@@ -706,61 +827,77 @@ func (rs *ReplicationServer) GetVolumeReplicationInfo(ctx context.Context,
 		return nil, status.Errorf(codes.Aborted, util.VolumeOperationAlreadyExistsFmt, volumeID)
 	}
 	defer rs.VolumeLocks.Release(volumeID)
-	rbdVol, err := corerbd.GenVolFromVolID(ctx, volumeID, cr, req.GetSecrets())
-	defer rbdVol.Destroy()
+	mgr := rbd.NewManager(rs.driverInstance, nil, req.GetSecrets())
+	defer mgr.Destroy(ctx)
+
+	rbdVol, err := mgr.GetVolumeByID(ctx, volumeID)
 	if err != nil {
+		log.ErrorLog(ctx, "failed to get volume with id %q: %v", volumeID, err)
+
 		switch {
 		case errors.Is(err, corerbd.ErrImageNotFound):
-			err = status.Errorf(codes.NotFound, "volume %s not found", volumeID)
+			err = status.Error(codes.NotFound, err.Error())
 		case errors.Is(err, util.ErrPoolNotFound):
-			err = status.Errorf(codes.NotFound, "pool %s not found for %s", rbdVol.Pool, volumeID)
+			err = status.Error(codes.NotFound, err.Error())
 		default:
-			err = status.Errorf(codes.Internal, err.Error())
+			err = status.Error(codes.Internal, err.Error())
 		}
 
 		return nil, err
 	}
-
-	mirroringInfo, err := rbdVol.GetImageMirroringInfo()
+	mirror, err := rbdVol.ToMirror()
 	if err != nil {
-		log.ErrorLog(ctx, err.Error())
-
-		return nil, status.Error(codes.Aborted, err.Error())
-	}
-
-	if mirroringInfo.State != librbd.MirrorImageEnabled {
-		return nil, status.Error(codes.InvalidArgument, "image mirroring is not enabled")
-	}
-
-	// return error if the image is not in primary state
-	if !mirroringInfo.Primary {
-		return nil, status.Error(codes.InvalidArgument, "image is not in primary state")
-	}
-
-	mirrorStatus, err := rbdVol.GetImageMirroringStatus()
-	if err != nil {
-		if errors.Is(err, corerbd.ErrImageNotFound) {
-			return nil, status.Error(codes.Aborted, err.Error())
-		}
-		log.ErrorLog(ctx, err.Error())
+		log.ErrorLog(ctx, "failed to convert volume %q to mirror type: %v", rbdVol, err)
 
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 
-	remoteStatus, err := RemoteStatus(mirrorStatus)
+	info, err := mirror.GetMirroringInfo(ctx)
 	if err != nil {
-		log.ErrorLog(ctx, err.Error())
+		log.ErrorLog(ctx, "failed to get info for mirror %q: %v", mirror, err)
+
+		return nil, status.Error(codes.Aborted, err.Error())
+	}
+
+	if info.GetState() != librbd.MirrorImageEnabled.String() {
+		return nil, status.Error(codes.InvalidArgument, "image mirroring is not enabled")
+	}
+
+	// return error if the image is not in primary state
+	if !info.IsPrimary() {
+		return nil, status.Error(codes.InvalidArgument, "image is not in primary state")
+	}
+
+	mirrorStatus, err := mirror.GetGlobalMirroringStatus(ctx)
+	if err != nil {
+		log.ErrorLog(ctx, "failed to get status for mirror %q: %v", mirror, err)
+
+		if errors.Is(err, corerbd.ErrImageNotFound) {
+			return nil, status.Error(codes.Aborted, err.Error())
+		}
+
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
+	remoteStatus, err := mirrorStatus.GetRemoteSiteStatus(ctx)
+	if err != nil {
+		log.ErrorLog(ctx, "failed to get remote site status for mirror %q: %v", mirror, err)
+
+		if errors.Is(err, librbd.ErrNotExist) {
+			return nil, status.Errorf(codes.NotFound, "failed to get remote status: %v", err)
+		}
 
 		return nil, status.Errorf(codes.Internal, "failed to get remote status: %v", err)
 	}
 
-	description := remoteStatus.Description
-	resp, err := getLastSyncInfo(description)
+	description := remoteStatus.GetDescription()
+	resp, err := getLastSyncInfo(ctx, description)
 	if err != nil {
+		log.ErrorLog(ctx, "failed to parse last sync info from %q: %v", description, err)
+
 		if errors.Is(err, corerbd.ErrLastSyncTimeNotFound) {
 			return nil, status.Errorf(codes.NotFound, "failed to get last sync info: %v", err)
 		}
-		log.ErrorLog(ctx, err.Error())
 
 		return nil, status.Errorf(codes.Internal, "failed to get last sync info: %v", err)
 	}
@@ -768,30 +905,10 @@ func (rs *ReplicationServer) GetVolumeReplicationInfo(ctx context.Context,
 	return resp, nil
 }
 
-// RemoteStatus returns one SiteMirrorImageStatus item from the SiteStatuses
-// slice that corresponds to the remote site's status. If the remote status
-// is not found than the error ErrNotExist will be returned.
-func RemoteStatus(gmis *librbd.GlobalMirrorImageStatus) (librbd.SiteMirrorImageStatus, error) {
-	var (
-		ss  librbd.SiteMirrorImageStatus
-		err error = librbd.ErrNotExist
-	)
-	for i := range gmis.SiteStatuses {
-		if gmis.SiteStatuses[i].MirrorUUID != "" {
-			ss = gmis.SiteStatuses[i]
-			err = nil
-
-			break
-		}
-	}
-
-	return ss, err
-}
-
 // This function gets the local snapshot time, last sync snapshot seconds
 // and last sync bytes from the description of localStatus and convert
 // it into required types.
-func getLastSyncInfo(description string) (*replication.GetVolumeReplicationInfoResponse, error) {
+func getLastSyncInfo(ctx context.Context, description string) (*replication.GetVolumeReplicationInfoResponse, error) {
 	// Format of the description will be as followed:
 	// description = `replaying, {"bytes_per_second":0.0,"bytes_per_snapshot":81920.0,
 	// "last_snapshot_bytes":81920,"last_snapshot_sync_seconds":0,
@@ -809,6 +926,7 @@ func getLastSyncInfo(description string) (*replication.GetVolumeReplicationInfoR
 	if description == "" {
 		return nil, fmt.Errorf("empty description: %w", corerbd.ErrLastSyncTimeNotFound)
 	}
+	log.DebugLog(ctx, "description: %s", description)
 	splittedString := strings.SplitN(description, ",", 2)
 	if len(splittedString) == 1 {
 		return nil, fmt.Errorf("no snapshot details: %w", corerbd.ErrLastSyncTimeNotFound)
@@ -853,21 +971,18 @@ func getLastSyncInfo(description string) (*replication.GetVolumeReplicationInfoR
 	return &response, nil
 }
 
-func checkVolumeResyncStatus(localStatus librbd.SiteMirrorImageStatus) error {
-	// we are considering 2 states to check resync started and resync completed
-	// as below. all other states will be considered as an error state so that
-	// cephCSI can return error message and volume replication operator can
-	// mark the VolumeReplication status as not resyncing for the volume.
-
-	// If the state is Replaying means the resync is going on.
-	// Once the volume on remote cluster is demoted and resync
-	// is completed the image state will be moved to UNKNOWN.
-	// RBD mirror daemon should be always running on the primary cluster.
-	if !localStatus.Up || (localStatus.State != librbd.MirrorImageStatusStateReplaying &&
-		localStatus.State != librbd.MirrorImageStatusStateUnknown) {
-		return fmt.Errorf(
-			"not resyncing. Local status: daemon up=%t image is in %q state",
-			localStatus.Up, localStatus.State)
+func checkVolumeResyncStatus(ctx context.Context, localStatus types.SiteStatus) error {
+	// we are considering local snapshot timestamp to check if the resync is
+	// started or not, if we dont see local_snapshot_timestamp in the
+	// description of localStatus, we are returning error. if we see the local
+	// snapshot timestamp in the description we return resyncing started.
+	description := localStatus.GetDescription()
+	resp, err := getLastSyncInfo(ctx, description)
+	if err != nil {
+		return fmt.Errorf("failed to get last sync info: %w", err)
+	}
+	if resp.GetLastSyncTime() == nil {
+		return errors.New("last sync time is nil")
 	}
 
 	return nil

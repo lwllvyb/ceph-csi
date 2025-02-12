@@ -82,7 +82,11 @@ func add(mgr manager.Manager, r reconcile.Reconciler) error {
 	}
 
 	// Watch for changes to PersistentVolumes
-	err = c.Watch(source.Kind(mgr.GetCache(), &corev1.PersistentVolume{}), &handler.EnqueueRequestForObject{})
+	err = c.Watch(source.Kind(
+		mgr.GetCache(),
+		&corev1.PersistentVolume{},
+		&handler.TypedEnqueueRequestForObject[*corev1.PersistentVolume]{}),
+	)
 	if err != nil {
 		return fmt.Errorf("failed to watch the changes: %w", err)
 	}
@@ -99,7 +103,7 @@ func (r *ReconcilePersistentVolume) getCredentials(
 
 	if name == "" || namespace == "" {
 		errStr := "secret name or secret namespace is empty"
-		log.ErrorLogMsg(errStr)
+		log.ErrorLogMsg("%v", errStr)
 
 		return nil, errors.New(errStr)
 	}
@@ -185,6 +189,7 @@ func (r *ReconcilePersistentVolume) reconcilePV(ctx context.Context, obj runtime
 		requestName,
 		pvcNamespace,
 		r.config.ClusterName,
+		r.config.InstanceID,
 		r.config.SetMetadata,
 		cr)
 	if err != nil {

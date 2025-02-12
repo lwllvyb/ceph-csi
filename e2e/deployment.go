@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"slices"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -231,15 +232,16 @@ func (yr *yamlResource) Do(action kubectlAction) error {
 // replaceNamespaceInTemplate() on it. There are several options for adjusting
 // templates, each has their own comment.
 type yamlResourceNamespaced struct {
-	filename  string
-	namespace string
+	filename            string
+	namespace           string
+	domainLabel         string
+	crushLocationLabels string
 
 	// set the number of replicas in a Deployment to 1.
 	oneReplica bool
 
-	// enable topology support (for RBD)
-	enableTopology bool
-	domainLabel    string
+	// enable read affinity support (for RBD)
+	enableReadAffinity bool
 }
 
 func (yrn *yamlResourceNamespaced) Do(action kubectlAction) error {
@@ -248,55 +250,30 @@ func (yrn *yamlResourceNamespaced) Do(action kubectlAction) error {
 		return fmt.Errorf("failed to read content from %q: %w", yrn.filename, err)
 	}
 
+	data = replaceLogLevelInTemplate(data)
+
+	// disable VGS alpha feature, TODO: remove this in next release (3.14.0)
+	data = disableVGSAlphaCLIArg(data)
+
 	if yrn.oneReplica {
 		data = oneReplicaDeployYaml(data)
-	}
-
-	if yrn.enableTopology {
-		data = enableTopologyInTemplate(data)
 	}
 
 	if yrn.domainLabel != "" {
 		data = addTopologyDomainsToDSYaml(data, yrn.domainLabel)
 	}
 
+	if yrn.enableReadAffinity {
+		data = enableReadAffinityInTemplate(data)
+	}
+
+	if yrn.crushLocationLabels != "" {
+		data = addCrsuhLocationLabels(data, yrn.crushLocationLabels)
+	}
+
 	err = retryKubectlInput(yrn.namespace, action, data, deployTimeout)
 	if err != nil {
 		return fmt.Errorf("failed to %s resource %q in namespace %q: %w", action, yrn.filename, yrn.namespace, err)
-	}
-
-	return nil
-}
-
-type rookNFSResource struct {
-	f           *framework.Framework
-	modules     []string
-	orchBackend string
-}
-
-func (rnr *rookNFSResource) Do(action kubectlAction) error {
-	if action != kubectlCreate {
-		// we won't disabled modules
-		return nil
-	}
-
-	for _, module := range rnr.modules {
-		cmd := fmt.Sprintf("ceph mgr module enable %s", module)
-		_, _, err := execCommandInToolBoxPod(rnr.f, cmd, rookNamespace)
-		if err != nil {
-			// depending on the Ceph/Rook version, modules are
-			// enabled by default
-			framework.Logf("enabling module %q failed: %v", module, err)
-		}
-	}
-
-	if rnr.orchBackend != "" {
-		// this is not required for all Rook versions, allow failing
-		cmd := fmt.Sprintf("ceph orch set backend %s", rnr.orchBackend)
-		_, _, err := execCommandInToolBoxPod(rnr.f, cmd, rookNamespace)
-		if err != nil {
-			framework.Logf("setting orch backend %q failed: %v", rnr.orchBackend, err)
-		}
 	}
 
 	return nil
@@ -371,17 +348,6 @@ func waitForDeploymentUpdate(
 	return nil
 }
 
-// contains check if slice contains string.
-func contains(s []string, e string) bool {
-	for _, a := range s {
-		if a == e {
-			return true
-		}
-	}
-
-	return false
-}
-
 func waitForContainersArgsUpdate(
 	c kubernetes.Interface,
 	ns,
@@ -420,7 +386,7 @@ func waitForContainersArgsUpdate(
 	}
 	cid := deployment.Spec.Template.Spec.Containers // cid: read as containers in deployment
 	for i := range cid {
-		if contains(containers, cid[i].Name) {
+		if slices.Contains(containers, cid[i].Name) {
 			match := false
 			for j, ak := range cid[i].Args {
 				if ak == key {

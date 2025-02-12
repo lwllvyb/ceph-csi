@@ -46,10 +46,10 @@ import (
 func (rv *rbdVolume) checkCloneImage(ctx context.Context, parentVol *rbdVolume) (bool, error) {
 	// generate temp cloned volume
 	tempClone := rv.generateTempClone()
-	defer tempClone.Destroy()
+	defer tempClone.Destroy(ctx)
 
 	snap := &rbdSnapshot{}
-	defer snap.Destroy()
+	defer snap.Destroy(ctx)
 	snap.RbdSnapName = rv.RbdImageName
 	snap.Pool = rv.Pool
 
@@ -141,7 +141,7 @@ func (rv *rbdVolume) createCloneFromImage(ctx context.Context, parentVol *rbdVol
 	defer func() {
 		if err != nil {
 			log.DebugLog(ctx, "Removing clone image %q", rv)
-			errDefer := rv.deleteImage(ctx)
+			errDefer := rv.Delete(ctx)
 			if errDefer != nil {
 				log.ErrorLog(ctx, "failed to delete clone image %q: %v", rv, errDefer)
 			}
@@ -155,7 +155,7 @@ func (rv *rbdVolume) createCloneFromImage(ctx context.Context, parentVol *rbdVol
 		return err
 	}
 
-	err = parentVol.copyEncryptionConfig(&rv.rbdImage, true)
+	err = parentVol.copyEncryptionConfig(ctx, &rv.rbdImage, true)
 	if err != nil {
 		return fmt.Errorf("failed to copy encryption config for %q: %w", rv, err)
 	}
@@ -183,6 +183,8 @@ func (rv *rbdVolume) doSnapClone(ctx context.Context, parentVol *rbdVolume) erro
 
 	// generate temp cloned volume
 	tempClone := rv.generateTempClone()
+	defer tempClone.Destroy(ctx)
+
 	// snapshot name is same as temporary cloned image, This helps to
 	// flatten the temporary cloned images as we cannot have more than 510
 	// snapshots on an rbd image
@@ -232,7 +234,7 @@ func (rv *rbdVolume) doSnapClone(ctx context.Context, parentVol *rbdVolume) erro
 		return errClone
 	}
 
-	err = parentVol.copyEncryptionConfig(&rv.rbdImage, true)
+	err = parentVol.copyEncryptionConfig(ctx, &rv.rbdImage, true)
 	if err != nil {
 		return fmt.Errorf("failed to copy encryption config for %q: %w", rv, err)
 	}
